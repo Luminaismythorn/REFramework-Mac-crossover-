@@ -150,6 +150,16 @@ void D3D12Hook::hook_streamline(HMODULE dlssg_module) try {
     spdlog::error("[Streamline] Failed to hook Streamline");
 }
 
+// Wine (and therefore CrossOver/Proton) exports wine_get_version from ntdll.dll; real Windows does not.
+static bool is_wine() {
+    static const bool result = []() {
+        const auto ntdll = GetModuleHandleA("ntdll.dll");
+        return ntdll != nullptr && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+    }();
+
+    return result;
+}
+
 // Isolated on purpose: functions containing __try/__except cannot also contain
 // C++ objects that need unwinding (e.g. std::vector, RAII guards), so this call
 // is pulled out into its own small function with no such locals.
@@ -159,11 +169,11 @@ void D3D12Hook::hook_streamline(HMODULE dlssg_module) try {
 // D3DMetal via CrossOver/Wine on macOS) instead of failing cleanly. Wrapping it
 // turns that hard crash into a normal, loggable failure so the rest of the game
 // can keep running even if this dummy-device step doesn't succeed.
-static HRESULT __declspec(noinline) d3d12_hook_call_create_device_safe(decltype(D3D12CreateDevice)* fn, D3D_FEATURE_LEVEL feature_level, ID3D12Device** device_out) {
+static HRESULT __declspec(noinline) d3d12_hook_call_create_device_safe(decltype(D3D12CreateDevice)* fn, IUnknown* adapter, D3D_FEATURE_LEVEL feature_level, ID3D12Device** device_out) {
     HRESULT hr = E_FAIL;
 
     __try {
-        hr = fn(nullptr, feature_level, IID_PPV_ARGS(device_out));
+        hr = fn(adapter, feature_level, IID_PPV_ARGS(device_out));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         spdlog::error("Exception occurred while calling D3D12CreateDevice directly (code {:x})", (unsigned long)GetExceptionCode());
         hr = E_FAIL;
@@ -226,55 +236,8 @@ bool D3D12Hook::hook() {
         return false;
     }
 
-    spdlog::info("Creating dummy device");
-
-    // Get the original on-disk bytes of the D3D12CreateDevice export
-    const auto original_bytes = utility::get_original_bytes(d3d12_create_device);
-
-    // Temporarily unhook D3D12CreateDevice
-    // it allows compatibility with ReShade and other overlays that hook it
-    // this is just a dummy device anyways, we don't want the other overlays to be able to use it
-    //
-    // TESTING: forcing the plain (unpatched) path unconditionally. On this platform
-    // (CrossOver/D3DMetal on macOS), d3d12.dll is not real Microsoft code, so the
-    // in-memory-vs-on-disk byte comparison above may false-positive as "hooked" for
-    // reasons unrelated to any actual overlay, sending execution down the risky
-    // patch/call/restore path below even when nothing has actually hooked this export.
-    // Skipping straight to the plain call tests that theory directly.
-    constexpr bool force_skip_unhook_dance = true;
-
-    if (original_bytes && !force_skip_unhook_dance) {
-        spdlog::info("D3D12CreateDevice appears to be hooked, temporarily unhooking");
-
-        std::vector<uint8_t> hooked_bytes(original_bytes->size());
-        memcpy(hooked_bytes.data(), d3d12_create_device, original_bytes->size());
-
-        ProtectionOverride protection_override{ d3d12_create_device, original_bytes->size(), PAGE_EXECUTE_READWRITE };
-        memcpy(d3d12_create_device, original_bytes->data(), original_bytes->size());
-
-        if (FAILED(d3d12_hook_call_create_device_safe(d3d12_create_device, feature_level, &device))) {
-            spdlog::error("Failed to create D3D12 Dummy device");
-            memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
-            return false;
-        }
-
-        spdlog::info("Restoring hooked bytes for D3D12CreateDevice");
-        memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
-    } else { // D3D12CreateDevice is not hooked (or we're forcing this path to test)
-        if (original_bytes) {
-            spdlog::info("D3D12CreateDevice appears to be hooked, but skipping the unhook dance (forced, testing macOS/D3DMetal theory)");
-        }
-
-        if (FAILED(d3d12_hook_call_create_device_safe(d3d12_create_device, feature_level, &device))) {
-            spdlog::error("Failed to create D3D12 Dummy device");
-            return false;
-        }
-    }
-
-
-    spdlog::info("Dummy device: {:x}", (uintptr_t)device);
-
     // Manually get CreateDXGIFactory export because the user may be running Windows 7
+    // (loaded before the dummy device now, because the Wine path below needs it to find an adapter)
     const auto dxgi_module = LoadLibraryA("dxgi.dll");
     if (dxgi_module == nullptr) {
         spdlog::error("Failed to load dxgi.dll");
@@ -287,6 +250,74 @@ bool D3D12Hook::hook() {
         spdlog::error("Failed to get CreateDXGIFactory export");
         return false;
     }
+
+    spdlog::info("Creating dummy device");
+
+    if (is_wine()) {
+        // Wine/CrossOver/D3DMetal: skip the "is D3D12CreateDevice hooked?" check used in the else branch.
+        // It compares the loaded d3d12.dll against the file on disk, which is not meaningful here
+        // (this isn't Microsoft's d3d12.dll), and patching live D3DMetal code is risky.
+        // Also, D3DMetal reportedly crashes when given a null adapter (see upstream PR #1589),
+        // so hand it a real adapter from DXGI instead.
+        spdlog::info("Wine detected, creating dummy device with an enumerated adapter (no unhook dance)");
+
+        IDXGIFactory4* adapter_factory{ nullptr };
+        if (FAILED(create_dxgi_factory(IID_PPV_ARGS(&adapter_factory)))) {
+            spdlog::error("Wine: failed to create DXGI factory for adapter enumeration");
+            return false;
+        }
+
+        IDXGIAdapter* adapter{ nullptr };
+        const auto enum_hr = adapter_factory->EnumAdapters(0, &adapter);
+        adapter_factory->Release();
+
+        if (FAILED(enum_hr) || adapter == nullptr) {
+            spdlog::error("Wine: no DXGI adapter found ({:x})", (uint32_t)enum_hr);
+            return false;
+        }
+
+        spdlog::info("Wine: calling D3D12CreateDevice with adapter {:x}", (uintptr_t)adapter);
+
+        const auto hr = d3d12_hook_call_create_device_safe(d3d12_create_device, adapter, feature_level, &device);
+        adapter->Release();
+
+        if (FAILED(hr)) {
+            spdlog::error("Wine: failed to create D3D12 dummy device ({:x})", (uint32_t)hr);
+            return false;
+        }
+    } else {
+        // Get the original on-disk bytes of the D3D12CreateDevice export
+        const auto original_bytes = utility::get_original_bytes(d3d12_create_device);
+
+        // Temporarily unhook D3D12CreateDevice
+        // it allows compatibility with ReShade and other overlays that hook it
+        // this is just a dummy device anyways, we don't want the other overlays to be able to use it
+        if (original_bytes) {
+            spdlog::info("D3D12CreateDevice appears to be hooked, temporarily unhooking");
+
+            std::vector<uint8_t> hooked_bytes(original_bytes->size());
+            memcpy(hooked_bytes.data(), d3d12_create_device, original_bytes->size());
+
+            ProtectionOverride protection_override{ d3d12_create_device, original_bytes->size(), PAGE_EXECUTE_READWRITE };
+            memcpy(d3d12_create_device, original_bytes->data(), original_bytes->size());
+
+            if (FAILED(d3d12_hook_call_create_device_safe(d3d12_create_device, nullptr, feature_level, &device))) {
+                spdlog::error("Failed to create D3D12 Dummy device");
+                memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
+                return false;
+            }
+
+            spdlog::info("Restoring hooked bytes for D3D12CreateDevice");
+            memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
+        } else { // D3D12CreateDevice is not hooked
+            if (FAILED(d3d12_hook_call_create_device_safe(d3d12_create_device, nullptr, feature_level, &device))) {
+                spdlog::error("Failed to create D3D12 Dummy device");
+                return false;
+            }
+        }
+    }
+
+    spdlog::info("Dummy device: {:x}", (uintptr_t)device);
 
     spdlog::info("Creating dummy DXGI factory");
 
