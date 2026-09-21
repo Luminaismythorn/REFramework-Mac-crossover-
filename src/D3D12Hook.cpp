@@ -160,6 +160,96 @@ static bool is_wine() {
     return result;
 }
 
+// --- Wine/D3DMetal command queue lookup helpers (adapted from upstream PR #1589) ---
+//
+// D3DMetal wraps its COM objects, so the raw pointer stored inside the swapchain is often NOT
+// the same address as the ID3D12CommandQueue* we created. QueryInterface can deadlock there,
+// so instead we identify the queue by refcount: hold one extra reference on our queue, then
+// AddRef/Release each candidate pointer and see if the count moves by exactly one.
+static constexpr auto COMMAND_QUEUE_SCAN_BYTES = 512 * sizeof(void*);
+static intptr_t s_wine_cq_delta = 0; // (our queue pointer) - (raw pointer found in the swapchain)
+
+struct HeldRefcountProbe {
+    IUnknown* object{};
+    ULONG held_refcount{};
+    bool valid{};
+};
+
+// These helpers use __try/__except, so they must not contain C++ objects that need unwinding.
+static HeldRefcountProbe hold_refcount_probe(IUnknown* object) {
+    HeldRefcountProbe probe{};
+
+    if (object == nullptr || IsBadReadPtr(object, sizeof(void*))) {
+        return probe;
+    }
+
+    __try {
+        probe.object = object;
+        probe.held_refcount = object->AddRef();
+        probe.valid = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Invalid COM pointer, ignore
+    }
+
+    return probe;
+}
+
+static void release_refcount_probe(HeldRefcountProbe& probe) {
+    if (!probe.valid || probe.object == nullptr) {
+        return;
+    }
+
+    __try {
+        probe.object->Release();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Invalid COM pointer, ignore
+    }
+
+    probe.valid = false;
+    probe.object = nullptr;
+    probe.held_refcount = 0;
+}
+
+static bool matches_refcount_probe(IUnknown* candidate, const HeldRefcountProbe& probe) {
+    if (!probe.valid || candidate == nullptr || IsBadReadPtr(candidate, sizeof(void*))) {
+        return false;
+    }
+
+    bool match = false;
+
+    __try {
+        const auto addref_result = candidate->AddRef();
+        const auto release_result = candidate->Release();
+        match = addref_result == probe.held_refcount + 1 && release_result == probe.held_refcount;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Invalid COM pointer, ignore
+    }
+
+    return match;
+}
+
+static uint32_t scan_for_refcount_match(void* object, const HeldRefcountProbe& probe) {
+    if (object == nullptr || !probe.valid) {
+        return 0;
+    }
+
+    for (auto i = 0; i < COMMAND_QUEUE_SCAN_BYTES; i += sizeof(void*)) {
+        const auto base = (uintptr_t)object + i;
+
+        if (IsBadReadPtr((void*)base, sizeof(void*))) {
+            break;
+        }
+
+        auto data = *(IUnknown**)base;
+
+        if (matches_refcount_probe(data, probe)) {
+            return i;
+        }
+    }
+
+    return 0;
+}
+
 // Isolated on purpose: functions containing __try/__except cannot also contain
 // C++ objects that need unwinding (e.g. std::vector, RAII guards), so this call
 // is pulled out into its own small function with no such locals.
@@ -466,6 +556,13 @@ bool D3D12Hook::hook() {
     spdlog::info("Finding command queue offset");
 
     s_command_queue_offset = 0;
+    s_wine_cq_delta = 0;
+
+    const auto wine = is_wine();
+    auto command_queue_refcount_probe = wine ? hold_refcount_probe(command_queue) : HeldRefcountProbe{};
+    utility::ScopeGuard refcount_guard{[&]() {
+        release_refcount_probe(command_queue_refcount_probe);
+    }};
 
     // Find the command queue offset in the swapchain
     for (auto i = 0; i < 512 * sizeof(void*); i += sizeof(void*)) {
@@ -482,6 +579,30 @@ bool D3D12Hook::hook() {
             s_command_queue_offset = i;
             spdlog::info("Found command queue offset: {:x}", i);
             break;
+        }
+    }
+
+    // Wine/D3DMetal: the queue may be stored under a different (wrapped) pointer, identify it by refcount
+    if (s_command_queue_offset == 0 && wine) {
+        s_command_queue_offset = scan_for_refcount_match(swap_chain1, command_queue_refcount_probe);
+
+        if (s_command_queue_offset != 0) {
+            spdlog::info("Found command queue offset via Wine refcount scan: {:x}", s_command_queue_offset);
+        }
+    }
+
+    // Wine/D3DMetal last resort: hardcoded offset reported in upstream PR #1589
+    if (s_command_queue_offset == 0 && wine) {
+        constexpr uint32_t WINE_D3DMETAL_CQ_OFFSET = 0x4C8;
+        const auto base = (uintptr_t)swap_chain1 + WINE_D3DMETAL_CQ_OFFSET;
+
+        if (!IsBadReadPtr((void*)base, sizeof(void*))) {
+            auto candidate = *(ID3D12CommandQueue**)base;
+
+            if (candidate != nullptr && !IsBadReadPtr((void*)candidate, sizeof(void*))) {
+                s_command_queue_offset = WINE_D3DMETAL_CQ_OFFSET;
+                spdlog::warn("Wine: using hardcoded command queue offset 0x{:x} (D3DMetal fallback)", WINE_D3DMETAL_CQ_OFFSET);
+            }
         }
     }
 
@@ -515,7 +636,9 @@ bool D3D12Hook::hook() {
 
                 auto data = *(ID3D12CommandQueue**)pre_data;
 
-                if (data == command_queue) {
+                const auto matched_by_refcount = wine && matches_refcount_probe(data, command_queue_refcount_probe);
+
+                if (data == command_queue || matched_by_refcount) {
                     // If we hook Streamline's Swapchain, the menu fails to render correctly/flickers
                     // So we switch out the swapchain with the internal one owned by Streamline
                     // Side note: Even though we are scanning for Proton here,
@@ -547,6 +670,18 @@ bool D3D12Hook::hook() {
     if (s_command_queue_offset == 0) {
         spdlog::error("Failed to find command queue offset");
         return false;
+    }
+
+    // Wine/D3DMetal: remember how far the raw pointer stored in the swapchain is from our real queue pointer.
+    // present() adds this difference back with plain arithmetic, so no COM calls are needed there.
+    if (wine && s_command_queue_offset != 0) {
+        const auto scan_object = m_using_proton_swapchain ? *(uintptr_t*)((uintptr_t)swap_chain1 + s_proton_swapchain_offset) : (uintptr_t)swap_chain1;
+        const auto raw = *(uintptr_t*)(scan_object + s_command_queue_offset);
+        s_wine_cq_delta = (intptr_t)((uintptr_t)command_queue - raw);
+
+        if (s_wine_cq_delta != 0) {
+            spdlog::info("Wine command queue delta: 0x{:X}", (uintptr_t)s_wine_cq_delta);
+        }
     }
 
     //utility::ThreadSuspender suspender{};
@@ -690,6 +825,11 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
         d3d12->m_command_queue = *(ID3D12CommandQueue**)(real_swapchain + d3d12->s_command_queue_offset);
     } else {
         d3d12->m_command_queue = *(ID3D12CommandQueue**)((uintptr_t)swap_chain + d3d12->s_command_queue_offset);
+    }
+
+    // Wine/D3DMetal: adjust the raw swapchain pointer by the delta computed in hook() (no COM calls)
+    if (s_wine_cq_delta != 0) {
+        d3d12->m_command_queue = (ID3D12CommandQueue*)((uintptr_t)d3d12->m_command_queue + s_wine_cq_delta);
     }
 
     if (d3d12->m_swapchain_0 == nullptr) {
