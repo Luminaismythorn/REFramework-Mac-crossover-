@@ -234,7 +234,16 @@ bool D3D12Hook::hook() {
     // Temporarily unhook D3D12CreateDevice
     // it allows compatibility with ReShade and other overlays that hook it
     // this is just a dummy device anyways, we don't want the other overlays to be able to use it
-    if (original_bytes) {
+    //
+    // TESTING: forcing the plain (unpatched) path unconditionally. On this platform
+    // (CrossOver/D3DMetal on macOS), d3d12.dll is not real Microsoft code, so the
+    // in-memory-vs-on-disk byte comparison above may false-positive as "hooked" for
+    // reasons unrelated to any actual overlay, sending execution down the risky
+    // patch/call/restore path below even when nothing has actually hooked this export.
+    // Skipping straight to the plain call tests that theory directly.
+    constexpr bool force_skip_unhook_dance = true;
+
+    if (original_bytes && !force_skip_unhook_dance) {
         spdlog::info("D3D12CreateDevice appears to be hooked, temporarily unhooking");
 
         std::vector<uint8_t> hooked_bytes(original_bytes->size());
@@ -251,12 +260,17 @@ bool D3D12Hook::hook() {
 
         spdlog::info("Restoring hooked bytes for D3D12CreateDevice");
         memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
-    } else { // D3D12CreateDevice is not hooked
+    } else { // D3D12CreateDevice is not hooked (or we're forcing this path to test)
+        if (original_bytes) {
+            spdlog::info("D3D12CreateDevice appears to be hooked, but skipping the unhook dance (forced, testing macOS/D3DMetal theory)");
+        }
+
         if (FAILED(d3d12_hook_call_create_device_safe(d3d12_create_device, feature_level, &device))) {
             spdlog::error("Failed to create D3D12 Dummy device");
             return false;
         }
     }
+
 
     spdlog::info("Dummy device: {:x}", (uintptr_t)device);
 
