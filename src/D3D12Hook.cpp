@@ -150,6 +150,28 @@ void D3D12Hook::hook_streamline(HMODULE dlssg_module) try {
     spdlog::error("[Streamline] Failed to hook Streamline");
 }
 
+// Isolated on purpose: functions containing __try/__except cannot also contain
+// C++ objects that need unwinding (e.g. std::vector, RAII guards), so this call
+// is pulled out into its own small function with no such locals.
+//
+// This exists because calling through a temporarily-unpatched D3D12CreateDevice
+// can crash outright under some non-Windows D3D12 translation layers (e.g.
+// D3DMetal via CrossOver/Wine on macOS) instead of failing cleanly. Wrapping it
+// turns that hard crash into a normal, loggable failure so the rest of the game
+// can keep running even if this dummy-device step doesn't succeed.
+static HRESULT __declspec(noinline) d3d12_hook_call_create_device_safe(decltype(D3D12CreateDevice)* fn, D3D_FEATURE_LEVEL feature_level, ID3D12Device** device_out) {
+    HRESULT hr = E_FAIL;
+
+    __try {
+        hr = fn(nullptr, feature_level, IID_PPV_ARGS(device_out));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        spdlog::error("Exception occurred while calling D3D12CreateDevice directly (code {:x})", (unsigned long)GetExceptionCode());
+        hr = E_FAIL;
+    }
+
+    return hr;
+}
+
 bool D3D12Hook::hook() {
     spdlog::info("Hooking D3D12");
 
@@ -220,8 +242,8 @@ bool D3D12Hook::hook() {
 
         ProtectionOverride protection_override{ d3d12_create_device, original_bytes->size(), PAGE_EXECUTE_READWRITE };
         memcpy(d3d12_create_device, original_bytes->data(), original_bytes->size());
-        
-        if (FAILED(d3d12_create_device(nullptr, feature_level, IID_PPV_ARGS(&device)))) {
+
+        if (FAILED(d3d12_hook_call_create_device_safe(d3d12_create_device, feature_level, &device))) {
             spdlog::error("Failed to create D3D12 Dummy device");
             memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
             return false;
@@ -230,7 +252,7 @@ bool D3D12Hook::hook() {
         spdlog::info("Restoring hooked bytes for D3D12CreateDevice");
         memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
     } else { // D3D12CreateDevice is not hooked
-        if (FAILED(d3d12_create_device(nullptr, feature_level, IID_PPV_ARGS(&device)))) {
+        if (FAILED(d3d12_hook_call_create_device_safe(d3d12_create_device, feature_level, &device))) {
             spdlog::error("Failed to create D3D12 Dummy device");
             return false;
         }
