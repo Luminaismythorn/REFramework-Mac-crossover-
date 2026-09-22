@@ -2,6 +2,7 @@
 #include <future>
 #include <unordered_set>
 #include <stacktrace>
+#include <cstring>
 #include <wrl/client.h>
 
 #include <spdlog/spdlog.h>
@@ -150,11 +151,32 @@ void D3D12Hook::hook_streamline(HMODULE dlssg_module) try {
     spdlog::error("[Streamline] Failed to hook Streamline");
 }
 
-// Wine (and therefore CrossOver/Proton) exports wine_get_version from ntdll.dll; real Windows does not.
-static bool is_wine() {
+// True only for Wine running on a macOS host (CrossOver / Game Porting Toolkit, where D3D12 is D3DMetal).
+// Wine exports wine_get_version/wine_get_host_version from ntdll.dll; real Windows does not.
+// Linux/Proton/Steam Deck report "Linux" here and keep the original code paths.
+static bool is_wine_on_macos() {
     static const bool result = []() {
         const auto ntdll = GetModuleHandleA("ntdll.dll");
-        return ntdll != nullptr && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+
+        if (ntdll == nullptr || GetProcAddress(ntdll, "wine_get_version") == nullptr) {
+            return false;
+        }
+
+        using wine_get_host_version_t = void(__cdecl*)(const char** sysname, const char** release);
+        const auto wine_get_host_version = (wine_get_host_version_t)GetProcAddress(ntdll, "wine_get_host_version");
+
+        if (wine_get_host_version == nullptr) {
+            return false;
+        }
+
+        const char* sysname = nullptr;
+        const char* release = nullptr;
+        wine_get_host_version(&sysname, &release);
+
+        const bool is_macos = sysname != nullptr && strcmp(sysname, "Darwin") == 0;
+        spdlog::info("Wine detected, host: {} {} -> macOS/D3DMetal paths {}", sysname != nullptr ? sysname : "?", release != nullptr ? release : "?", is_macos ? "enabled" : "disabled");
+
+        return is_macos;
     }();
 
     return result;
@@ -343,13 +365,13 @@ bool D3D12Hook::hook() {
 
     spdlog::info("Creating dummy device");
 
-    if (is_wine()) {
+    if (is_wine_on_macos()) {
         // Wine/CrossOver/D3DMetal: skip the "is D3D12CreateDevice hooked?" check used in the else branch.
         // It compares the loaded d3d12.dll against the file on disk, which is not meaningful here
         // (this isn't Microsoft's d3d12.dll), and patching live D3DMetal code is risky.
         // Also, D3DMetal reportedly crashes when given a null adapter (see upstream PR #1589),
         // so hand it a real adapter from DXGI instead.
-        spdlog::info("Wine detected, creating dummy device with an enumerated adapter (no unhook dance)");
+        spdlog::info("Wine on macOS detected, creating dummy device with an enumerated adapter (no unhook dance)");
 
         IDXGIFactory4* adapter_factory{ nullptr };
         if (FAILED(create_dxgi_factory(IID_PPV_ARGS(&adapter_factory)))) {
@@ -558,7 +580,7 @@ bool D3D12Hook::hook() {
     s_command_queue_offset = 0;
     s_wine_cq_delta = 0;
 
-    const auto wine = is_wine();
+    const auto wine = is_wine_on_macos();
     auto command_queue_refcount_probe = wine ? hold_refcount_probe(command_queue) : HeldRefcountProbe{};
     utility::ScopeGuard refcount_guard{[&]() {
         release_refcount_probe(command_queue_refcount_probe);
